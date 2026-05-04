@@ -1,0 +1,389 @@
+---
+- name: Deploy ecommerce on EC2
+  hosts: all
+  become: yes
+
+  vars:
+    app_name: ecommerce
+    app_port: 3000
+    app_dir: /opt/ecommerce
+    db_type: postgres
+    db_name: "{{ db_name | default('ecommerce') }}"
+    db_username: "{{ db_username | default('ecommerce') }}"
+    db_password: "{{ db_password | default('ecommerce') }}"
+    db_host: "{{ db_host | default('localhost') }}"
+    db_port: "{{ db_port | default('5432') }}"
+    install_db: "{{ install_db | default('false') }}"
+    node_version: "18"
+    java_version: "17"
+    python_version: "3.11"
+
+  tasks:
+
+    # ── System prerequisites ──────────────────────────────────────────────────
+
+    - name: "Update apt cache"
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: "Install base packages"
+      apt:
+        name:
+          - curl
+          - git
+          - unzip
+          - ca-certificates
+          - gnupg
+          - lsb-release
+          - software-properties-common
+          - nginx
+        state: present
+
+    # ── PostgreSQL (conditional) ──────────────────────────────────────────────
+
+    - name: "Install PostgreSQL"
+      apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+          - python3-psycopg2
+        state: present
+      when: install_db == 'true'
+
+    - name: "Ensure PostgreSQL is started"
+      service:
+        name: postgresql
+        state: started
+        enabled: yes
+      when: install_db == 'true'
+
+    - name: "Fix pg_hba.conf to use md5 auth"
+      shell: |
+        HBA=$(find /etc/postgresql -name pg_hba.conf | head -1)
+        sed -i 's/scram-sha-256/md5/g' "$HBA"
+        systemctl reload postgresql
+      when: install_db == 'true'
+
+    - name: "Create application database"
+      shell: |
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'" | grep -q 1 || \
+        sudo -u postgres psql -c "CREATE DATABASE {{ db_name }};"
+      when: install_db == 'true'
+
+    - name: "Create database user"
+      shell: |
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ db_username }}'" | grep -q 1 || \
+        sudo -u postgres psql -c "CREATE USER {{ db_username }} WITH ENCRYPTED PASSWORD '{{ db_password }}';"
+      when: install_db == 'true'
+
+    - name: "Grant privileges to database user"
+      shell: |
+        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ db_username }};"
+      when: install_db == 'true'
+
+    # ── Node.js 18 ────────────────────────────────────────────────────────────
+
+    - name: "Add NodeSource GPG key"
+      shell: |
+        curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | \
+          gpg --dearmor -o /usr/share/keyrings/nodesource.gpg
+      args:
+        creates: /usr/share/keyrings/nodesource.gpg
+
+    - name: "Add NodeSource repository"
+      shell: |
+        echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_{{ node_version }}.x nodistro main" \
+          > /etc/apt/sources.list.d/nodesource.list
+      args:
+        creates: /etc/apt/sources.list.d/nodesource.list
+
+    - name: "Update apt cache after adding NodeSource"
+      apt:
+        update_cache: yes
+
+    - name: "Install Node.js {{ node_version }}"
+      apt:
+        name: nodejs
+        state: present
+
+    # ── Java 17 ───────────────────────────────────────────────────────────────
+
+    - name: "Install Java {{ java_version }}"
+      apt:
+        name: "openjdk-{{ java_version }}-jdk"
+        state: present
+
+    # ── Maven ─────────────────────────────────────────────────────────────────
+
+    - name: "Install Maven"
+      apt:
+        name: maven
+        state: present
+
+    # ── Python 3.11 ───────────────────────────────────────────────────────────
+
+    - name: "Add deadsnakes PPA for Python"
+      apt_repository:
+        repo: "ppa:deadsnakes/ppa"
+        state: present
+
+    - name: "Install Python {{ python_version }}"
+      apt:
+        name:
+          - "python{{ python_version }}"
+          - "python{{ python_version }}-venv"
+          - "python{{ python_version }}-dev"
+          - pip
+        state: present
+        update_cache: yes
+
+    # ── Application directory ─────────────────────────────────────────────────
+
+    - name: "Create application directory"
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0755"
+
+    - name: "Copy application source to remote"
+      synchronize:
+        src: "{{ playbook_dir }}/../"
+        dest: "{{ app_dir }}/"
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=ansible"
+          - "--exclude=terraform"
+          - "--exclude=__pycache__"
+          - "--exclude=*.pyc"
+          - "--exclude=node_modules"
+          - "--exclude=target"
+
+    - name: "Set ownership of application directory"
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        recurse: yes
+
+    # ── Write .env file ───────────────────────────────────────────────────────
+
+    - name: "Write .env file"
+      shell: |
+        printf '' > {{ app_dir }}/.env
+        printf 'PORT={{ app_port }}\n' >> {{ app_dir }}/.env
+        printf 'DB_TYPE={{ db_type }}\n' >> {{ app_dir }}/.env
+        printf 'DB_HOST={{ db_host }}\n' >> {{ app_dir }}/.env
+        printf 'DB_PORT={{ db_port }}\n' >> {{ app_dir }}/.env
+        printf 'DB_NAME={{ db_name }}\n' >> {{ app_dir }}/.env
+        printf 'DB_USERNAME={{ db_username }}\n' >> {{ app_dir }}/.env
+        printf 'DB_PASSWORD={{ db_password }}\n' >> {{ app_dir }}/.env
+        printf 'DATABASE_URL=postgresql://{{ db_username }}:{{ db_password }}@{{ db_host }}:{{ db_port }}/{{ db_name }}\n' >> {{ app_dir }}/.env
+      args:
+        executable: /bin/bash
+
+    # ── Detect project type and build ─────────────────────────────────────────
+
+    - name: "Check for pom.xml (Maven/Java project)"
+      stat:
+        path: "{{ app_dir }}/pom.xml"
+      register: pom_xml
+
+    - name: "Check for package.json (Node project)"
+      stat:
+        path: "{{ app_dir }}/package.json"
+      register: package_json
+
+    - name: "Check for requirements.txt (Python project)"
+      stat:
+        path: "{{ app_dir }}/requirements.txt"
+      register: requirements_txt
+
+    - name: "Check for pyproject.toml (Python project)"
+      stat:
+        path: "{{ app_dir }}/pyproject.toml"
+      register: pyproject_toml
+
+    # ── Maven build ───────────────────────────────────────────────────────────
+
+    - name: "Maven build"
+      shell: |
+        cd {{ app_dir }}
+        mvn clean package -DskipTests -q
+      become: yes
+      become_user: ubuntu
+      when: pom_xml.stat.exists
+
+    # ── Node.js install ───────────────────────────────────────────────────────
+
+    - name: "npm install"
+      shell: |
+        cd {{ app_dir }}
+        npm install --production
+      become: yes
+      become_user: ubuntu
+      when: package_json.stat.exists and not pom_xml.stat.exists
+
+    # ── Python virtualenv + install ───────────────────────────────────────────
+
+    - name: "Create Python virtualenv"
+      shell: |
+        python{{ python_version }} -m venv {{ app_dir }}/venv
+      become: yes
+      become_user: ubuntu
+      when: (requirements_txt.stat.exists or pyproject_toml.stat.exists) and not pom_xml.stat.exists and not package_json.stat.exists
+
+    - name: "Install Python requirements"
+      shell: |
+        cd {{ app_dir }}
+        ./venv/bin/pip install --upgrade pip
+        ./venv/bin/pip install -r requirements.txt
+      become: yes
+      become_user: ubuntu
+      when: requirements_txt.stat.exists and not pom_xml.stat.exists and not package_json.stat.exists
+
+    - name: "Install Python pyproject dependencies"
+      shell: |
+        cd {{ app_dir }}
+        ./venv/bin/pip install --upgrade pip
+        ./venv/bin/pip install .
+      become: yes
+      become_user: ubuntu
+      when: pyproject_toml.stat.exists and not requirements_txt.stat.exists and not pom_xml.stat.exists and not package_json.stat.exists
+
+    # ── Find Maven JAR ────────────────────────────────────────────────────────
+
+    - name: "Find built JAR file"
+      shell: |
+        find {{ app_dir }}/target -maxdepth 1 -name "*.jar" ! -name "*sources*" ! -name "*javadoc*" | head -1
+      register: jar_file
+      when: pom_xml.stat.exists
+      changed_when: false
+
+    # ── systemd service ───────────────────────────────────────────────────────
+
+    - name: "Create systemd service for Java app"
+      copy:
+        dest: /etc/systemd/system/ecommerce.service
+        content: |
+          [Unit]
+          Description=ecommerce Java application
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=ubuntu
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/.env
+          ExecStart=/usr/bin/java -jar {{ jar_file.stdout }}
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+      when: pom_xml.stat.exists and jar_file.stdout != ''
+
+    - name: "Create systemd service for Node app"
+      copy:
+        dest: /etc/systemd/system/ecommerce.service
+        content: |
+          [Unit]
+          Description=ecommerce Node.js application
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=ubuntu
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/.env
+          ExecStart=/usr/bin/node index.js
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+      when: package_json.stat.exists and not pom_xml.stat.exists
+
+    - name: "Create systemd service for Python app"
+      copy:
+        dest: /etc/systemd/system/ecommerce.service
+        content: |
+          [Unit]
+          Description=ecommerce Python application
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=ubuntu
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/.env
+          ExecStart={{ app_dir }}/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port {{ app_port }}
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+      when: (requirements_txt.stat.exists or pyproject_toml.stat.exists) and not pom_xml.stat.exists and not package_json.stat.exists
+
+    - name: "Reload systemd daemon"
+      systemd:
+        daemon_reload: yes
+
+    - name: "Enable and start ecommerce service"
+      systemd:
+        name: ecommerce
+        state: restarted
+        enabled: yes
+
+    # ── Nginx reverse proxy ───────────────────────────────────────────────────
+
+    - name: "Remove default nginx site"
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: "Configure nginx reverse proxy"
+      copy:
+        dest: /etc/nginx/sites-available/ecommerce
+        content: |
+          server {
+              listen 80;
+              server_name _;
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_cache_bypass $http_upgrade;
+              }
+          }
+
+    - name: "Enable nginx site"
+      file:
+        src: /etc/nginx/sites-available/ecommerce
+        dest: /etc/nginx/sites-enabled/ecommerce
+        state: link
+
+    - name: "Test nginx configuration"
+      shell: nginx -t
+      changed_when: false
+
+    - name: "Restart nginx"
+      service:
+        name: nginx
+        state: restarted
+        enabled: yes
