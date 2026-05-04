@@ -124,9 +124,11 @@
     # ── Python 3.11 ───────────────────────────────────────────────────────────
 
     - name: "Add deadsnakes PPA for Python"
-      apt_repository:
-        repo: "ppa:deadsnakes/ppa"
-        state: present
+      shell: |
+        add-apt-repository -y ppa:deadsnakes/ppa
+        apt-get update -qq
+      args:
+        executable: /bin/bash
 
     - name: "Install Python {{ python_version }}"
       apt:
